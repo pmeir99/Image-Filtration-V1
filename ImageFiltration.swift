@@ -258,17 +258,23 @@ final class Editor: ObservableObject {
 struct EditorView: View {
     @ObservedObject var editor: Editor
 
+    private func fittedSize(_ image: CGImage, in bounds: CGSize) -> CGSize {
+        let width = CGFloat(image.width)
+        let height = CGFloat(image.height)
+        let ratio = Swift.min(bounds.width / width, bounds.height / height)
+        return CGSize(width: width * ratio, height: height * ratio)
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             GeometryReader { geometry in
                 if let image = editor.preview {
-                    let ratio = min(geometry.size.width / CGFloat(image.width), geometry.size.height / CGFloat(image.height))
-                    let size = CGSize(width: CGFloat(image.width) * ratio, height: CGFloat(image.height) * ratio)
+                    let size = fittedSize(image, in: geometry.size)
                     Image(decorative: image, scale: 1)
                         .resizable()
                         .frame(width: size.width, height: size.height)
                         .contentShape(Rectangle())
-                        .onSpatialTapGesture { editor.click($0.location, size: size) }
+                        .onTapGesture(coordinateSpace: .local) { point in editor.click(point, size: size) }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     ContentUnavailableView {
