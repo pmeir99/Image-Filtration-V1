@@ -25,7 +25,27 @@ struct Subjects {
     let labels: [UInt8]
     let masks: [Int: CIImage]
 
-    static func detect(_ image: CGImage) throws -> Subjects {
+    static func detect(_ original: CGImage) throws -> Subjects {
+        let maximumDimension: CGFloat = 1024
+        let scale = min(1, maximumDimension / CGFloat(max(original.width, original.height)))
+        let image: CGImage
+        if scale < 1 {
+            let input = CIImage(cgImage: original).transformed(
+                by: CGAffineTransform(scaleX: scale, y: scale)
+            )
+            let context = CIContext(options: [.cacheIntermediates: false])
+            guard let resized = context.createCGImage(input, from: input.extent.integral) else {
+                throw CocoaError(.fileReadUnknown)
+            }
+            image = resized
+        } else {
+            image = original
+        }
+
+        let maskTransform = CGAffineTransform(
+            scaleX: CGFloat(original.width) / CGFloat(image.width),
+            y: CGFloat(original.height) / CGFloat(image.height)
+        )
         let request = VNGenerateForegroundInstanceMaskRequest()
         let handler = VNImageRequestHandler(cgImage: image)
         try handler.perform([request])
@@ -40,6 +60,7 @@ struct Subjects {
         for id in result.allInstances {
             let mask = try result.generateScaledMaskForImage(forInstances: IndexSet(integer: id), from: handler)
             masks[id] = CIImage(cvPixelBuffer: mask, options: [.colorSpace: NSNull()])
+                .transformed(by: maskTransform)
         }
         return Subjects(width: width, height: height, labels: labels, masks: masks)
     }
@@ -134,6 +155,8 @@ final class Editor: ObservableObject {
             }
         }
         captionTask = Task {
+            await detectionTask?.value
+            guard !Task.isCancelled, current == generation else { return }
             let model = SystemLanguageModel.default
             if #available(macOS 27.0, *), model.isAvailable {
                 let input = scaled(CIImage(cgImage: image), maximum: 768)
@@ -169,14 +192,12 @@ final class Editor: ObservableObject {
         selection = id
         if !edits.contains(where: { $0.id == id }) {
             edits.append(MaskEdit(id: id, mask: mask))
-            refresh()
         }
     }
 
     func removeSelected() {
         edits.removeAll { $0.id == selection }
         selection = nil
-        refresh()
     }
 
     private func scaled(_ image: CIImage, maximum: CGFloat) -> CIImage {
