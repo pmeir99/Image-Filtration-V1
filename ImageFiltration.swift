@@ -101,6 +101,7 @@ final class Editor: ObservableObject {
     @Published var selection: Int?
     @Published var caption = ""
     @Published var status = ""
+    @Published var processingTime = ""
     @Published var message: String?
     @Published var updateURL: URL?
     private var subjects: Subjects?
@@ -117,6 +118,7 @@ final class Editor: ObservableObject {
     }
 
     func load(_ url: URL) {
+        let started = DispatchTime.now().uptimeNanoseconds
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
               let width = properties[kCGImagePropertyPixelWidth] as? Int,
@@ -139,6 +141,7 @@ final class Editor: ObservableObject {
         edits = []
         selection = nil
         status = "Finding subjects…"
+        processingTime = ""
         caption = "Describing image…"
 
         detectionTask = Task {
@@ -149,7 +152,16 @@ final class Editor: ObservableObject {
             switch result {
             case .success(let detected):
                 subjects = detected
-                status = detected.masks.isEmpty ? "No foreground subjects found." : "Click a subject to add or edit its mask."
+                status = "Checking subjects for automatic blur…"
+                let result = await automaticBlur(image, subjects: detected)
+                guard !Task.isCancelled, current == generation else { return }
+                for edit in result.edits where !edits.contains(where: { $0.id == edit.id }) {
+                    edits.append(edit)
+                }
+                if !result.edits.isEmpty { refresh() }
+                status = result.status
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+                processingTime = String(format: "%.3f s (%.0f ms)", elapsed / 1000, elapsed)
             case .failure:
                 status = "Subject detection failed for this image."
             }
@@ -182,6 +194,70 @@ final class Editor: ObservableObject {
             guard !Task.isCancelled, current == generation else { return }
             caption = tags.isEmpty ? "No description available." : "Detected: " + tags.joined(separator: ", ")
         }
+    }
+
+    private func automaticBlur(_ image: CGImage, subjects: Subjects) async -> (edits: [MaskEdit], status: String) {
+        guard !subjects.masks.isEmpty else { return ([], "No foreground subjects found.") }
+        let model = SystemLanguageModel.default
+        guard #available(macOS 27.0, *), model.isAvailable else {
+            return ([], "Automatic blur needs Apple Intelligence. Click a subject to mask it manually.")
+        }
+
+        let source = CIImage(cgImage: image)
+        var bounds: [Int: CGRect] = [:]
+        for (index, label) in subjects.labels.enumerated() where label != 0 {
+            let pixel = CGRect(x: index % subjects.width, y: index / subjects.width, width: 1, height: 1)
+            let id = Int(label)
+            bounds[id] = bounds[id]?.union(pixel) ?? pixel
+        }
+        let sx = source.extent.width / CGFloat(subjects.width)
+        let sy = source.extent.height / CGFloat(subjects.height)
+        var matches: [MaskEdit] = []
+        var failures = 0
+
+        for id in bounds.keys.sorted() {
+            guard !Task.isCancelled else { break }
+            guard let box = bounds[id], let mask = subjects.masks[id] else { continue }
+            let crop = CGRect(
+                x: box.minX * sx,
+                y: (CGFloat(subjects.height) - box.maxY) * sy,
+                width: box.width * sx,
+                height: box.height * sy
+            ).insetBy(dx: -2 * sx, dy: -2 * sy).intersection(source.extent).integral
+
+            let isolated = source.cropped(to: crop).applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: CIImage(color: CIColor(red: 0.5, green: 0.5, blue: 0.5)).cropped(to: crop),
+                kCIInputMaskImageKey: mask.cropped(to: crop)
+            ]).cropped(to: crop)
+            let input = scaled(isolated, maximum: 384)
+            guard let thumbnail = context.createCGImage(input, from: input.extent.integral) else {
+                failures += 1
+                continue
+            }
+
+            do {
+                let response = try await LanguageModelSession(model: model).respond {
+                    """
+                    Classify the isolated subject for photo masking based on visible presentation.
+                    Reply exactly BLUR for a female-presenting person.
+                    Reply exactly KEEP for a male-presenting person, an object, or an unclear subject.
+                    """
+                    Attachment(thumbnail)
+                }
+                let decision = response.content.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+                if decision == "BLUR" {
+                    matches.append(MaskEdit(id: id, mask: mask, strength: max(36, Double(source.extent.width) * 0.035)))
+                } else if decision != "KEEP" {
+                    failures += 1
+                }
+            } catch {
+                failures += 1
+            }
+        }
+
+        let summary = "Automatically blurred \(matches.count) " + (matches.count == 1 ? "subject." : "subjects.")
+        let detail = failures == 0 ? "Click any detected subject to edit its mask." : "Some subjects could not be classified. Click to mask them manually."
+        return (matches, summary + " " + detail)
     }
 
     func click(_ point: CGPoint, size: CGSize) {
@@ -320,6 +396,10 @@ struct EditorView: View {
                     .textSelection(.enabled)
                 if !editor.status.isEmpty {
                     Text(editor.status).font(.callout).foregroundStyle(.secondary)
+                }
+                if !editor.processingTime.isEmpty {
+                    LabeledContent("Detection + blur", value: editor.processingTime)
+                        .font(.callout.monospacedDigit())
                 }
                 Divider()
                 ForEach(editor.edits) { edit in
